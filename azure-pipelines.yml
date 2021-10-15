@@ -1,0 +1,105 @@
+pool:
+  name: Azure Pipelines
+  demands: npm
+
+steps:
+- task: Npm@1
+  displayName: 'npm install'
+  inputs:
+    workingDir: '$(Build.SourcesDirectory)'
+    verbose: false
+
+- task: Npm@1
+  displayName: 'npm custom'
+  inputs:
+    command: custom
+    workingDir: '$(Build.SourcesDirectory)'
+    verbose: false
+    customCommand: 'run scan-dotnetthoughts'
+
+- powershell: |
+   function Get-ObjectMembers {
+       [CmdletBinding()]
+       Param(
+           [Parameter(Mandatory=$True, ValueFromPipeline=$True)]
+           [PSCustomObject]$obj
+       )
+       $obj | Get-Member -MemberType NoteProperty | ForEach-Object {
+           $key = $_.Name
+           [PSCustomObject]@{Key = $key; Value = $obj."$key"}
+       }
+   }
+   
+   $lighthouse_report = Get-Content dotnetthoughts.report.json | ConvertFrom-Json
+   
+   $audits = $lighthouse_report.audits
+   $timingEntries = $lighthouse_report.timing.entries
+   
+   $junitTemplate = @'
+   <testsuite name="">
+       <testcase id="" name="" time="">
+           <failure></failure>
+       </testcase>
+   </testsuite>
+   '@
+   
+   $xml = New-Object xml
+   $xml.LoadXml($junitTemplate)
+   $testCaseTemplate = (@($xml.testsuite.testcase)[0]).Clone()
+   
+   $xml.testsuite.name = $lighthouse_report.requestedUrl.ToString()
+   
+   $audits | Get-ObjectMembers | foreach {
+   if($_.Value.scoreDisplayMode -and 
+       $_.Value.scoreDisplayMode -ne "manual" -and $_.Value.scoreDisplayMode -eq "binary"){
+   
+           $testCase = $testCaseTemplate.clone()
+           $testCase.id = $_.Value.id.ToString()
+           $testCase.name = $_.Value.title.ToString()
+   
+           $entryName = "lh:audit:" + $_.Value.id.ToString()
+           
+           $timingEntries | foreach {
+               if($_.name -eq $entryName){
+                   $testCase.time = $_.duration.ToString()
+               }
+           }
+   
+   
+           if(-not $_.Value.score){
+               $testCase.ChildNodes[0].innerText = $_.Value.description.ToString()
+           } else {
+               $testCase.RemoveChild($testCase.ChildNodes[0]) | Out-Null
+           }
+   
+           $xml.testsuite.AppendChild($testCase) > $null
+       }
+   }
+   
+   $xml.testsuite.testcase | Where-Object { $_.Name -eq "" } | ForEach-Object  { [void]$xml.testsuite.RemoveChild($_) }
+   $outputFileName = "junit-report-test.xml"
+   $outputFile = Join-Path $(Build.ArtifactStagingDirectory) $outputFileName
+   $xml.Save($outputFile)
+   Write-Output $outputFile
+  displayName: 'PowerShell Script'
+
+- task: CopyFiles@2
+  displayName: 'Copy Files to: $(Build.ArtifactStagingDirectory)'
+  inputs:
+    SourceFolder: '$(Build.SourcesDirectory)'
+    Contents: |
+     dotnetthoughts*.html
+     dotnetthoughts*.json
+     junit-report-*.xml
+    TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+- task: PublishTestResults@2
+  displayName: 'Publish Test Results junit-report-test.xml'
+  inputs:
+    testResultsFiles: 'junit-report-test.xml'
+    searchFolder: '$(Build.ArtifactStagingDirectory)'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish Artifact: light-house-scan-output'
+  inputs:
+    ArtifactName: 'light-house-scan-output'
